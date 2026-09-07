@@ -1,6 +1,8 @@
 """
-Busca dividendos de ações (PlayInvest) e FIIs (StatusInvest) e grava no Firestore.
-Roda como GitHub Action 1x por dia.
+Busca dividendos:
+  - Ações: PlayInvest (HTML scraping)
+  - FIIs: Yahoo Finance via yfinance (API JSON)
+Grava no Firestore. Roda como GitHub Action 1x por dia.
 """
 import os
 import json
@@ -10,25 +12,21 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+import yfinance as yf
 
-# ============ CONFIG ============
-DELAY = 2  # seconds between requests
+DELAY = 2
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
-# ============ FIREBASE INIT ============
+# ============ FIREBASE ============
 def init_firebase():
-    cred_json = os.environ.get("FIREBASE_CREDENTIALS")
-    if not cred_json:
-        raise ValueError("FIREBASE_CREDENTIALS env var not set")
-    cred = credentials.Certificate(json.loads(cred_json))
+    cred = credentials.Certificate(json.loads(os.environ["FIREBASE_CREDENTIALS"]))
     firebase_admin.initialize_app(cred)
     return firestore.client()
 
 # ============ PLAYINVEST (AÇÕES) ============
 def fetch_playinvest(ticker):
-    """Busca dividendos de ações no PlayInvest."""
     url = f"https://playinvest.com.br/dividendos/{ticker.lower()}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -46,95 +44,39 @@ def fetch_playinvest(ticker):
             val_text = cells[4].get_text(strip=True) if len(cells) > 4 else cells[1].get_text(strip=True)
             try:
                 rate = float(val_text.replace(",", "."))
-            except (ValueError, AttributeError):
+            except:
                 continue
             if dc and rate > 0:
                 divs.append({"dc": dc, "dp": dp or dc, "r": rate, "l": tipo})
         return divs
     except Exception as e:
-        print(f"    PlayInvest error: {e}")
+        print(f"    PlayInvest erro: {e}")
         return []
 
-# ============ STATUSINVEST (FIIs) ============
-def fetch_statusinvest_fii(ticker):
-    """Busca dividendos de FIIs no StatusInvest via endpoint interno JSON."""
-    url = f"https://statusinvest.com.br/fii/companytickerprovents?ticker={ticker}&chartProventsType=2"
-    headers = {
-        **HEADERS,
-        "Referer": f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}",
-        "Accept": "*/*",
-        "X-Requested-With": "XMLHttpRequest"
-    }
+# ============ YAHOO FINANCE (FIIs) ============
+def fetch_yahoo_fii(ticker):
+    """Busca dividendos de FIIs via yfinance."""
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            print(f"    StatusInvest HTTP {resp.status_code}")
+        tk = yf.Ticker(f"{ticker}.SA")
+        divs_df = tk.dividends
+        if divs_df is None or divs_df.empty:
             return []
         
-        data = resp.json()
-        divs = []
-        
-        # O endpoint retorna JSON com estrutura variável
-        # Tentar diferentes formatos de resposta
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            # Pode vir como {assetEarningsModels: [...]} ou {assetEarningsYearlyModels: [...]}
-            items = data.get("assetEarningsModels", [])
-            if not items:
-                items = data.get("earningsThisYear", [])
-            if not items:
-                items = data.get("earningsLastYear", [])
-            if not items:
-                # Tentar pegar todos os valores de qualquer chave que seja lista
-                for key, val in data.items():
-                    if isinstance(val, list) and len(val) > 0:
-                        items = val
-                        break
-        
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            # Extrair campos — StatusInvest usa vários nomes
-            dc = item.get("ed") or item.get("lastDatePrior") or item.get("com") or ""
-            dp = item.get("pd") or item.get("paymentDate") or item.get("payment") or ""
-            rate = item.get("v") or item.get("value") or item.get("val") or 0
-            label = item.get("et") or item.get("label") or item.get("type") or "RENDIMENTO"
-            
-            # Normalizar datas (pode vir como "2024-06-03T00:00:00" ou "03/06/2024")
-            dc = normalize_date(dc)
-            dp = normalize_date(dp)
-            
-            if isinstance(rate, str):
-                try:
-                    rate = float(rate.replace(",", "."))
-                except:
-                    continue
-            
-            if dc and rate and rate > 0:
-                divs.append({"dc": dc, "dp": dp or dc, "r": rate, "l": str(label)})
-        
-        return divs
+        result = []
+        for date, amount in divs_df.items():
+            if amount > 0:
+                # yfinance retorna a ex-date como index
+                dc = date.strftime("%Y-%m-%d")
+                result.append({
+                    "dc": dc,
+                    "dp": dc,  # Yahoo não dá data de pagamento separada
+                    "r": round(float(amount), 6),
+                    "l": "RENDIMENTO"
+                })
+        return result
     except Exception as e:
-        print(f"    StatusInvest error: {e}")
+        print(f"    Yahoo erro: {e}")
         return []
-
-def normalize_date(d):
-    """Normaliza datas em vários formatos para YYYY-MM-DD."""
-    if not d:
-        return None
-    d = str(d).strip()
-    # ISO format: 2024-06-03T00:00:00
-    if "T" in d:
-        return d[:10]
-    # BR format: 03/06/2024
-    if "/" in d:
-        return parse_date_br(d)
-    # Already YYYY-MM-DD
-    if len(d) == 10 and d[4] == "-":
-        return d
-    return None
 
 def parse_date_br(text):
     if not text:
@@ -195,101 +137,91 @@ def main():
     
     db = init_firebase()
     
-    # Load ativos
-    ativos_doc = db.collection("investimentos").document("ativos").get()
-    if not ativos_doc.exists:
-        print("Nenhum ativo no Firestore.")
-        return
+    ativos = db.collection("investimentos").document("ativos").get()
+    if not ativos.exists:
+        print("Nenhum ativo."); return
     
-    ativos = ativos_doc.to_dict().get("lista", [])
-    carteira = [a for a in ativos if a.get("s") == "C"]
+    lista = ativos.to_dict().get("lista", [])
+    carteira = [a for a in lista if a.get("s") == "C"]
     
-    # Separar ações/FIIs
-    acoes = [a["k"] for a in carteira if a.get("tp") in ("AÇÕES",)]
+    acoes = [a["k"] for a in carteira if a.get("tp") == "AÇÕES"]
     fiis = [a["k"] for a in carteira if a.get("tp") == "FII"]
-    # ETFs e Crypto não têm dividendos relevantes
     
-    print(f"Ações: {len(acoes)} → PlayInvest")
-    print(f"FIIs:  {len(fiis)} → StatusInvest")
+    print(f"Ações: {len(acoes)} (PlayInvest)")
+    print(f"FIIs:  {len(fiis)} (Yahoo Finance)")
     
-    # Load operations
     ops_doc = db.collection("investimentos").document("operacoes").get()
     operations = ops_doc.to_dict() if ops_doc.exists else {}
     
-    # Load existing
     div_doc = db.collection("investimentos").document("dividendos").get()
-    existing = div_doc.to_dict() if div_doc.exists else {}
-    existing_dy = existing.get("dy_known", {})
+    existing_dy = div_doc.to_dict().get("dy_known", {}) if div_doc.exists else {}
     
     all_events = {}
     
-    # --- AÇÕES via PlayInvest ---
+    # --- AÇÕES ---
     print(f"\n{'='*40}")
     print("AÇÕES — PlayInvest")
     print(f"{'='*40}")
-    success_a = 0
+    ok_a = 0
     for i, tk in enumerate(acoes):
-        print(f"[{i+1}/{len(acoes)}] {tk}...", end="")
-        events = fetch_playinvest(tk)
-        if events:
-            all_events[tk] = events
-            success_a += 1
-            print(f" ✓ {len(events)} eventos")
+        print(f"[{i+1}/{len(acoes)}] {tk}...", end="", flush=True)
+        ev = fetch_playinvest(tk)
+        if ev:
+            all_events[tk] = ev
+            ok_a += 1
+            print(f" ✓ {len(ev)} eventos")
         else:
-            print(f" ✗ 0 eventos")
+            print(f" ✗")
         time.sleep(DELAY)
     
-    # --- FIIs via StatusInvest ---
+    # --- FIIs ---
     print(f"\n{'='*40}")
-    print("FIIs — StatusInvest")
+    print("FIIs — Yahoo Finance")
     print(f"{'='*40}")
-    success_f = 0
+    ok_f = 0
     for i, tk in enumerate(fiis):
-        print(f"[{i+1}/{len(fiis)}] {tk}...", end="")
-        events = fetch_statusinvest_fii(tk)
-        if events:
-            all_events[tk] = events
-            success_f += 1
-            print(f" ✓ {len(events)} eventos")
+        print(f"[{i+1}/{len(fiis)}] {tk}...", end="", flush=True)
+        ev = fetch_yahoo_fii(tk)
+        if ev:
+            all_events[tk] = ev
+            ok_f += 1
+            print(f" ✓ {len(ev)} eventos")
         else:
-            print(f" ✗ 0 eventos")
-        time.sleep(DELAY)
+            print(f" ✗")
+        time.sleep(1)
     
-    print(f"\nResumo fetch: Ações {success_a}/{len(acoes)}, FIIs {success_f}/{len(fiis)}")
+    print(f"\nFetch: Ações {ok_a}/{len(acoes)}, FIIs {ok_f}/{len(fiis)}")
     
-    # Process
+    # --- Process ---
     print(f"\n{'='*40}")
-    print("Calculando DY com sharesAt()...")
+    print("Calculando DY × sharesAt()...")
     print(f"{'='*40}")
     dy_known, monthly, filtered = process_dividends(all_events, operations)
     
-    # Merge: keep existing for tickers that failed
+    # Keep existing for failed tickers
     for tk, val in existing_dy.items():
         if tk not in dy_known:
             dy_known[tk] = val
     
-    total_dy = sum(dy_known.values())
-    print(f"DY total: R$ {total_dy:.2f} ({len(dy_known)} tickers)")
-    print(f"Meses: {len(monthly)}")
+    total = sum(dy_known.values())
+    print(f"Total DY: R$ {total:.2f} ({len(dy_known)} tickers, {len(monthly)} meses)")
     
-    # Save
+    # --- Save ---
     db.collection("investimentos").document("dividendos").set({
         "dy_known": dy_known,
         "mensal": monthly,
         "eventos": filtered,
         "ultimaAtualizacao": datetime.now().isoformat(),
-        "fonte": "PlayInvest (ações) + StatusInvest (FIIs)"
+        "fonte": "PlayInvest (ações) + Yahoo Finance (FIIs)"
     })
-    print("✓ Salvo no Firestore!")
+    print("✓ Firestore salvo!")
     
-    # Detail
+    # --- Detail ---
     print(f"\n{'='*40}")
-    print("Detalhe por ticker")
-    print(f"{'='*40}")
     for tk in sorted(dy_known.keys()):
         n = len(filtered.get(tk, []))
-        src = "PlayInvest" if tk in acoes else "StatusInvest" if tk in fiis else "existente"
-        print(f"  {tk}: R$ {dy_known[tk]:.2f} ({n} eventos) [{src}]")
+        src = "PI" if tk in acoes else "YF" if tk in fiis else "?"
+        print(f"  {tk}: R$ {dy_known[tk]:.2f} ({n} ev) [{src}]")
 
 if __name__ == "__main__":
     main()

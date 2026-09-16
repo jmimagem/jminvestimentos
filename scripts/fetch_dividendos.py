@@ -144,14 +144,18 @@ def main():
     lista = ativos.to_dict().get("lista", [])
     carteira = [a for a in lista if a.get("s") == "C"]
     
-    acoes = [a["k"] for a in carteira if a.get("tp") == "AÇÕES"]
-    fiis = [a["k"] for a in carteira if a.get("tp") == "FII"]
-    
-    print(f"Ações: {len(acoes)} (PlayInvest)")
-    print(f"FIIs:  {len(fiis)} (Yahoo Finance)")
-    
+    # Também buscar Wishlist que têm operações (ativos vendidos com DY pendente)
     ops_doc = db.collection("investimentos").document("operacoes").get()
     operations = ops_doc.to_dict() if ops_doc.exists else {}
+    
+    wishlist_com_ops = [a for a in lista if a.get("s") == "W" and a["k"] in operations]
+    todos = carteira + wishlist_com_ops
+    
+    acoes = [a["k"] for a in todos if a.get("tp") == "AÇÕES"]
+    fiis = [a["k"] for a in todos if a.get("tp") == "FII"]
+    
+    print(f"Ações: {len(acoes)} (PlayInvest) — inclui {len([a for a in wishlist_com_ops if a.get('tp')=='AÇÕES'])} vendidos")
+    print(f"FIIs:  {len(fiis)} (Yahoo Finance) — inclui {len([a for a in wishlist_com_ops if a.get('tp')=='FII'])} vendidos")
     
     div_doc = db.collection("investimentos").document("dividendos").get()
     existing_dy = div_doc.to_dict().get("dy_known", {}) if div_doc.exists else {}
@@ -216,7 +220,62 @@ def main():
     })
     print("✓ Firestore salvo!")
     
+    # === FUNDAMENTAIS via yfinance (P/L, P/VP, LPA, VPA, DY) ===
+    print(f"\n{'='*40}")
+    print("Buscando dados fundamentalistas (yfinance)...")
+    print(f"{'='*40}")
+    
+    all_tickers = acoes + fiis
+    fundamentos = {}
+    existing_fund_doc = db.collection("investimentos").document("fundamentos").get()
+    existing_fund = existing_fund_doc.to_dict() if existing_fund_doc.exists else {}
+    
+    for i, tk in enumerate(all_tickers):
+        print(f"[{i+1}/{len(all_tickers)}] {tk}...", end="", flush=True)
+        try:
+            ytk = yf.Ticker(f"{tk}.SA")
+            info = ytk.info or {}
+            
+            pl = info.get('trailingPE') or info.get('forwardPE') or 0
+            pvp = info.get('priceToBook') or 0
+            dy = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0
+            lpa = info.get('trailingEps') or 0
+            vpa = info.get('bookValue') or 0
+            price = info.get('regularMarketPrice') or info.get('currentPrice') or 0
+            name = info.get('longName') or info.get('shortName') or tk
+            sector = info.get('sector') or info.get('industry') or ''
+            
+            if pl or pvp or price:
+                fundamentos[tk] = {
+                    'pl': round(pl, 2) if pl else 0,
+                    'pvp': round(pvp, 2) if pvp else 0,
+                    'dy': round(dy * 100, 2) if dy and dy < 1 else round(dy, 2) if dy else 0,
+                    'lpa': round(lpa, 2) if lpa else 0,
+                    'vpa': round(vpa, 2) if vpa else 0,
+                    'price': round(price, 2) if price else 0,
+                    'name': name,
+                    'sector': sector
+                }
+                print(f" ✓ P/L={fundamentos[tk]['pl']} P/VP={fundamentos[tk]['pvp']} DY={fundamentos[tk]['dy']}%")
+            else:
+                print(f" ✗ sem dados")
+        except Exception as e:
+            print(f" ✗ {e}")
+        time.sleep(1)
+    
+    # Merge com existentes (manter os que não foram atualizados)
+    for tk, val in existing_fund.items():
+        if tk not in fundamentos and tk != 'ultimaAtualizacao':
+            fundamentos[tk] = val
+    
+    fundamentos['ultimaAtualizacao'] = datetime.now().isoformat()
+    db.collection("investimentos").document("fundamentos").set(fundamentos)
+    print(f"✓ Fundamentos salvos: {len(fundamentos)-1} tickers")
+    
     # --- Detail ---
+    print(f"\n{'='*40}")
+    print("Resumo Dividendos")
+    print(f"{'='*40}")
     print(f"\n{'='*40}")
     for tk in sorted(dy_known.keys()):
         n = len(filtered.get(tk, []))

@@ -220,18 +220,57 @@ def main():
     })
     print("✓ Firestore salvo!")
     
-    # === FUNDAMENTAIS via yfinance (P/L, P/VP, LPA, VPA, DY) ===
-    print(f"\n{'='*40}")
-    print("Buscando dados fundamentalistas (yfinance)...")
-    print(f"{'='*40}")
+    # === FUNDAMENTAIS via yfinance — TODOS os tickers da B3 ===
+    print(f"\n{'='*60}")
+    print("Buscando fundamentos de TODOS os tickers B3 (yfinance)...")
+    print(f"{'='*60}")
     
-    all_tickers = acoes + fiis
+    # Lista abrangente: Ibovespa + SmallCaps + FIIs + ETFs
+    B3_TICKERS = [
+        # Ibovespa
+        'ABEV3','ALPA4','ALOS3','ARZZ3','ASAI3','AZUL4','B3SA3','BBAS3','BBDC3','BBDC4',
+        'BBSE3','BEEF3','BPAC11','BRAP4','BRFS3','BRKM5','CASH3','CCRO3','CIEL3','CMIG4',
+        'CMIN3','COGN3','CPFE3','CPLE6','CRFB3','CSAN3','CSNA3','CVCB3','CYRE3','DXCO3',
+        'ECOR3','EGIE3','ELET3','ELET6','EMBR3','ENEV3','ENGI11','EQTL3','EZTC3','FLRY3',
+        'GGBR4','GOAU4','GOLL4','HAPV3','HYPE3','IGTI11','IRBR3','ITSA4','ITUB4','JBSS3',
+        'KLBN11','KLBN4','LREN3','LWSA3','MGLU3','MRFG3','MRVE3','MULT3','NTCO3','PCAR3',
+        'PETR3','PETR4','PETZ3','POSI3','PRIO3','QUAL3','RADL3','RAIL3','RAIZ4','RCSL3',
+        'RDOR3','RENT3','RRRP3','SANB11','SBSP3','SLCE3','SMTO3','SOMA3','SUZB3','TAEE11',
+        'TIMS3','TOTS3','UGPA3','USIM5','VALE3','VBBR3','VIVT3','WEGE3','YDUQ3',
+        # SmallCaps populares
+        'ABCB4','ALSO3','AURE3','BMGB4','BOAS3','BRSR6','CAML3','CBAV3','CEAB3','CGAS5',
+        'CLSA3','CPLE3','CSMG3','DIRR3','DMMO3','ELMD3','ENBR3','EVEN3','FESA4','FIQE3',
+        'GRND3','HBSA3','INTB3','ISAE4','JHSF3','KEPL3','LAVV3','LEVE3','LJQQ3','LOGG3',
+        'MDIA3','MEGA3','MLAS3','MOVI3','MTRE3','MYPK3','NEOE3','ODPV3','OIBR3','PARD3',
+        'PGMN3','PINE4','PLPL3','POMO4','PTBL3','RAPT4','RECV3','RNEW4','ROMI3','RSUL4',
+        'SAPR11','SBFG3','SEER3','SIMH3','SMFT3','SOJA3','SQIA3','STBP3','TASA4','TGMA3',
+        'TRIS3','TUPY3','UNIP6','VAMO3','VIIA3','VLID3','VULC3','WIZC3',
+        # FIIs populares
+        'BCFF11','BTLG11','CPTS11','DEVA11','GGRC11','HGBS11','HGCR11','HGLG11','HGRE11',
+        'HGRU11','HSML11','IRDM11','JSRE11','KNCR11','KNIP11','KNRI11','LVBI11','MXRF11',
+        'PVBI11','RBRF11','RBRR11','RECR11','RZAK11','RZAT11','RZTR11','SNEL11','TGAR11',
+        'TRXF11','TVRI11','URPR11','VISC11','VGIP11','VILG11','XPLG11','XPML11',
+        # ETFs
+        'BOVA11','IVVB11','SMAL11','HASH11','GOLD11','SPXI11','DIVO11',
+    ]
+    
+    # Adicionar tickers da carteira/wishlist que não estejam na lista
+    for a in lista:
+        tk = a.get("k","")
+        if tk and tk not in B3_TICKERS and tk not in ('USDBRL','BTCBRL','ETHBRL'):
+            B3_TICKERS.append(tk)
+    
+    B3_TICKERS = sorted(set(B3_TICKERS))
+    print(f"Total: {len(B3_TICKERS)} tickers")
+    
     fundamentos = {}
     existing_fund_doc = db.collection("investimentos").document("fundamentos").get()
     existing_fund = existing_fund_doc.to_dict() if existing_fund_doc.exists else {}
     
-    for i, tk in enumerate(all_tickers):
-        print(f"[{i+1}/{len(all_tickers)}] {tk}...", end="", flush=True)
+    ok_fund = 0
+    for i, tk in enumerate(B3_TICKERS):
+        if (i+1) % 20 == 0 or i == 0:
+            print(f"[{i+1}/{len(B3_TICKERS)}]", end="", flush=True)
         try:
             ytk = yf.Ticker(f"{tk}.SA")
             info = ytk.info or {}
@@ -256,21 +295,22 @@ def main():
                     'name': name,
                     'sector': sector
                 }
-                print(f" ✓ P/L={fundamentos[tk]['pl']} P/VP={fundamentos[tk]['pvp']} DY={fundamentos[tk]['dy']}%")
-            else:
-                print(f" ✗ sem dados")
+                ok_fund += 1
         except Exception as e:
-            print(f" ✗ {e}")
-        time.sleep(1)
+            pass
+        time.sleep(0.8)
     
-    # Merge com existentes (manter os que não foram atualizados)
-    for tk, val in existing_fund.items():
-        if tk not in fundamentos and tk != 'ultimaAtualizacao':
-            fundamentos[tk] = val
+    print(f"\nFundamentos: {ok_fund}/{len(B3_TICKERS)} OK")
     
     fundamentos['ultimaAtualizacao'] = datetime.now().isoformat()
+    
+    # Firestore doc tem limite de 1MB — verificar tamanho
+    import sys
+    fund_size = sys.getsizeof(json.dumps(fundamentos))
+    print(f"Tamanho: {fund_size/1024:.1f} KB")
+    
     db.collection("investimentos").document("fundamentos").set(fundamentos)
-    print(f"✓ Fundamentos salvos: {len(fundamentos)-1} tickers")
+    print(f"✓ Fundamentos salvos: {ok_fund} tickers")
     
     # --- Detail ---
     print(f"\n{'='*40}")

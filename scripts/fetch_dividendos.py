@@ -1,348 +1,326 @@
 """
-Busca balanços da CVM (DFP/ITR) e calcula indicadores fundamentalistas.
-Salva no Firestore para uso no dashboard e Analista Graham.
+Busca dividendos:
+  - Ações: PlayInvest (HTML scraping)
+  - FIIs: Yahoo Finance via yfinance (API JSON)
+Grava no Firestore. Roda como GitHub Action 1x por dia.
 """
 import os
 import json
 import time
-import zipfile
-import io
 import requests
-import pandas as pd
+from bs4 import BeautifulSoup
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+import yfinance as yf
 
-CVM_BASE = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC"
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+DELAY = 2
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+}
 
+# ============ FIREBASE ============
 def init_firebase():
     cred = credentials.Certificate(json.loads(os.environ["FIREBASE_CREDENTIALS"]))
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
+    firebase_admin.initialize_app(cred)
     return firestore.client()
 
-def download_cvm_csv(doc_type, year):
-    """Baixa e extrai CSV da CVM. doc_type: DFP ou ITR."""
-    url = f"{CVM_BASE}/{doc_type}/DADOS/{doc_type.lower()}_cia_aberta_{year}.zip"
-    print(f"  Baixando {url}...")
+# ============ PLAYINVEST (AÇÕES) ============
+def fetch_playinvest(ticker):
+    url = f"https://playinvest.com.br/dividendos/{ticker.lower()}"
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=60)
+        resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            print(f"  ✗ HTTP {resp.status_code}")
-            return {}
-        
-        zf = zipfile.ZipFile(io.BytesIO(resp.content))
-        dfs = {}
-        for name in zf.namelist():
-            if name.endswith('.csv'):
-                key = name.split('_cia_aberta_')[0].split('/')[-1].upper()
-                try:
-                    df = pd.read_csv(zf.open(name), sep=';', encoding='latin-1', 
-                                     dtype=str, on_bad_lines='skip')
-                    dfs[key] = df
-                    print(f"    {key}: {len(df)} linhas")
-                except Exception as e:
-                    print(f"    {key}: erro {e}")
-        return dfs
+            return []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        divs = []
+        for row in soup.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 4:
+                continue
+            dc = parse_date_br(cells[0].get_text(strip=True))
+            dp = parse_date_br(cells[2].get_text(strip=True))
+            tipo = cells[3].get_text(strip=True)
+            val_text = cells[4].get_text(strip=True) if len(cells) > 4 else cells[1].get_text(strip=True)
+            try:
+                rate = float(val_text.replace(",", "."))
+            except:
+                continue
+            if dc and rate > 0:
+                divs.append({"dc": dc, "dp": dp or dc, "r": rate, "l": tipo})
+        return divs
     except Exception as e:
-        print(f"  ✗ Erro: {e}")
-        return {}
+        print(f"    PlayInvest erro: {e}")
+        return []
 
-def extract_financials(dfs_by_year):
-    """Extrai dados financeiros consolidados por empresa/ticker."""
-    companies = {}  # {CNPJ: {nome, dados por periodo}}
-    
-    for year, dfs in dfs_by_year.items():
-        # DRE - Demonstração de Resultado
-        dre_key = [k for k in dfs.keys() if 'DRE' in k]
-        if dre_key:
-            df = dfs[dre_key[0]]
-            # Filtrar consolidado (ORDEM_EXERC=ÚLTIMO, GRUPO_DFP=DF Consolidado)
-            if 'ORDEM_EXERC' in df.columns:
-                df = df[df['ORDEM_EXERC'] == 'ÚLTIMO']
-            if 'GRUPO_DFP' in df.columns:
-                df_cons = df[df['GRUPO_DFP'].str.contains('Consolidado', na=False)]
-                if len(df_cons) > 0:
-                    df = df_cons
-            
-            for _, row in df.iterrows():
-                cnpj = str(row.get('CNPJ_CIA', '')).strip()
-                nome = str(row.get('DENOM_CIA', '')).strip()
-                dt_ref = str(row.get('DT_REFER', '')).strip()
-                conta = str(row.get('CD_CONTA', '')).strip()
-                desc = str(row.get('DS_CONTA', '')).strip()
-                try:
-                    valor = float(str(row.get('VL_CONTA', '0')).replace(',', '.')) * 1000  # CVM em milhares
-                except:
-                    valor = 0
-                
-                if not cnpj or not dt_ref:
-                    continue
-                
-                if cnpj not in companies:
-                    companies[cnpj] = {'nome': nome, 'periodos': {}}
-                
-                if dt_ref not in companies[cnpj]['periodos']:
-                    companies[cnpj]['periodos'][dt_ref] = {}
-                
-                # Mapear contas relevantes
-                if conta == '3.01':
-                    companies[cnpj]['periodos'][dt_ref]['receita'] = valor
-                elif conta == '3.11':
-                    companies[cnpj]['periodos'][dt_ref]['lucro_liquido'] = valor
-                elif conta == '3.05':
-                    companies[cnpj]['periodos'][dt_ref]['ebit'] = valor
-        
-        # BPP - Balanço Patrimonial Passivo (Patrimônio Líquido)
-        bpp_key = [k for k in dfs.keys() if 'BPP' in k]
-        if bpp_key:
-            df = dfs[bpp_key[0]]
-            if 'ORDEM_EXERC' in df.columns:
-                df = df[df['ORDEM_EXERC'] == 'ÚLTIMO']
-            if 'GRUPO_DFP' in df.columns:
-                df_cons = df[df['GRUPO_DFP'].str.contains('Consolidado', na=False)]
-                if len(df_cons) > 0:
-                    df = df_cons
-            
-            for _, row in df.iterrows():
-                cnpj = str(row.get('CNPJ_CIA', '')).strip()
-                dt_ref = str(row.get('DT_REFER', '')).strip()
-                conta = str(row.get('CD_CONTA', '')).strip()
-                try:
-                    valor = float(str(row.get('VL_CONTA', '0')).replace(',', '.')) * 1000
-                except:
-                    valor = 0
-                
-                if not cnpj or not dt_ref:
-                    continue
-                if cnpj not in companies:
-                    continue
-                if dt_ref not in companies[cnpj]['periodos']:
-                    companies[cnpj]['periodos'][dt_ref] = {}
-                
-                if conta == '2.03':  # Patrimônio Líquido Consolidado
-                    companies[cnpj]['periodos'][dt_ref]['patrimonio_liquido'] = valor
-                elif conta == '2.01':  # Passivo Circulante
-                    companies[cnpj]['periodos'][dt_ref]['passivo_circulante'] = valor
-                elif conta == '2.02':  # Passivo Não Circulante
-                    companies[cnpj]['periodos'][dt_ref]['passivo_nao_circulante'] = valor
-        
-        # BPA - Balanço Patrimonial Ativo
-        bpa_key = [k for k in dfs.keys() if 'BPA' in k]
-        if bpa_key:
-            df = dfs[bpa_key[0]]
-            if 'ORDEM_EXERC' in df.columns:
-                df = df[df['ORDEM_EXERC'] == 'ÚLTIMO']
-            if 'GRUPO_DFP' in df.columns:
-                df_cons = df[df['GRUPO_DFP'].str.contains('Consolidado', na=False)]
-                if len(df_cons) > 0:
-                    df = df_cons
-            
-            for _, row in df.iterrows():
-                cnpj = str(row.get('CNPJ_CIA', '')).strip()
-                dt_ref = str(row.get('DT_REFER', '')).strip()
-                conta = str(row.get('CD_CONTA', '')).strip()
-                try:
-                    valor = float(str(row.get('VL_CONTA', '0')).replace(',', '.')) * 1000
-                except:
-                    valor = 0
-                
-                if not cnpj or cnpj not in companies:
-                    continue
-                if dt_ref not in companies[cnpj].get('periodos', {}):
-                    continue
-                
-                if conta == '1':  # Ativo Total
-                    companies[cnpj]['periodos'][dt_ref]['ativo_total'] = valor
-                elif conta == '1.01':  # Ativo Circulante
-                    companies[cnpj]['periodos'][dt_ref]['ativo_circulante'] = valor
-    
-    return companies
-
-def calculate_metrics(companies, ticker_map):
-    """Calcula indicadores fundamentalistas por ticker."""
-    results = {}
-    
-    for cnpj, data in companies.items():
-        ticker = ticker_map.get(cnpj)
-        if not ticker:
-            continue
-        
-        periodos = sorted(data['periodos'].keys(), reverse=True)
-        if not periodos:
-            continue
-        
-        metrics = {
-            'nome': data['nome'],
-            'periodos_disponiveis': periodos[:8],
-            'historico': []
-        }
-        
-        for dt in periodos[:8]:  # Últimos 8 períodos
-            p = data['periodos'][dt]
-            rec = p.get('receita', 0)
-            ll = p.get('lucro_liquido', 0)
-            pl_val = p.get('patrimonio_liquido', 0)
-            ebit = p.get('ebit', 0)
-            at = p.get('ativo_total', 0)
-            pc = p.get('passivo_circulante', 0)
-            pnc = p.get('passivo_nao_circulante', 0)
-            
-            entry = {
-                'periodo': dt,
-                'receita': round(rec / 1e6, 2),  # Em milhões
-                'lucro_liquido': round(ll / 1e6, 2),
-                'patrimonio_liquido': round(pl_val / 1e6, 2),
-                'ebit': round(ebit / 1e6, 2),
-                'ativo_total': round(at / 1e6, 2),
-                'divida_bruta': round((pc + pnc) / 1e6, 2),
-                'margem_liquida': round(ll / rec * 100, 2) if rec else 0,
-                'roe': round(ll / pl_val * 100, 2) if pl_val else 0,
-                'divida_pl': round((pc + pnc) / pl_val, 2) if pl_val else 0,
-                'margem_ebit': round(ebit / rec * 100, 2) if rec else 0,
-            }
-            metrics['historico'].append(entry)
-        
-        # Calcular crescimento
-        if len(metrics['historico']) >= 2:
-            h = metrics['historico']
-            rec_atual = h[0]['receita']
-            rec_ant = h[1]['receita']
-            ll_atual = h[0]['lucro_liquido']
-            ll_ant = h[1]['lucro_liquido']
-            
-            metrics['cresc_receita'] = round((rec_atual - rec_ant) / abs(rec_ant) * 100, 2) if rec_ant else 0
-            metrics['cresc_lucro'] = round((ll_atual - ll_ant) / abs(ll_ant) * 100, 2) if ll_ant else 0
-        
-        # Último período como resumo
-        if metrics['historico']:
-            last = metrics['historico'][0]
-            metrics['ultimo_periodo'] = last['periodo']
-            metrics['margem_liquida'] = last['margem_liquida']
-            metrics['roe'] = last['roe']
-            metrics['divida_pl'] = last['divida_pl']
-            metrics['receita_mm'] = last['receita']
-            metrics['lucro_mm'] = last['lucro_liquido']
-        
-        results[ticker] = metrics
-    
-    return results
-
-def load_ticker_cnpj_map():
-    """Carrega mapeamento ticker → CNPJ do cadastro CVM."""
-    url = "https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"
+# ============ YAHOO FINANCE (FIIs) ============
+def fetch_yahoo_fii(ticker):
+    """Busca dividendos de FIIs via yfinance."""
     try:
-        df = pd.read_csv(url, sep=';', encoding='latin-1', dtype=str)
-        ticker_map = {}  # CNPJ → ticker
-        for _, row in df.iterrows():
-            cnpj = str(row.get('CNPJ_CIA', '')).strip()
-            cd_cvm = str(row.get('CD_CVM', '')).strip()
-            nome = str(row.get('DENOM_SOCIAL', '')).strip()
-            sit = str(row.get('SIT_REG', '')).strip()
-            if sit == 'ATIVO' and cnpj:
-                ticker_map[cnpj] = {'cd_cvm': cd_cvm, 'nome': nome}
-        return ticker_map
+        tk = yf.Ticker(f"{ticker}.SA")
+        divs_df = tk.dividends
+        if divs_df is None or divs_df.empty:
+            return []
+        
+        result = []
+        for date, amount in divs_df.items():
+            if amount > 0:
+                # yfinance retorna a ex-date como index
+                dc = date.strftime("%Y-%m-%d")
+                result.append({
+                    "dc": dc,
+                    "dp": dc,  # Yahoo não dá data de pagamento separada
+                    "r": round(float(amount), 6),
+                    "l": "RENDIMENTO"
+                })
+        return result
     except Exception as e:
-        print(f"Erro carregando cadastro CVM: {e}")
-        return {}
+        print(f"    Yahoo erro: {e}")
+        return []
 
-def build_cnpj_ticker_map(fundamentos):
-    """Constrói mapa CNPJ → ticker usando dados do yfinance (que tem o CNPJ em some cases)."""
-    # Mapeamento manual dos principais tickers brasileiros
-    # Fonte: B3/CVM cadastro
-    MANUAL_MAP = {
-        '33.000.167/0001-01': 'PETR4', '33.000.167/0002-93': 'PETR3',
-        '00.000.000/0001-91': 'BBAS3',
-        '60.746.948/0001-12': 'BBDC4', '60.746.948/0002-03': 'BBDC3',
-        '60.872.504/0001-23': 'ITUB4',
-        '61.532.644/0001-15': 'ITSA4',
-        '33.592.510/0001-54': 'VALE3',
-        '84.429.695/0001-11': 'WEGE3',
-        '02.916.265/0001-60': 'B3SA3',
-        '33.611.500/0001-19': 'ELET3',
-        '20.706.413/0001-07': 'CMIG4',
-        '76.535.764/0001-43': 'CPLE6', '76.535.764/0002-24': 'CPLE3',
-        '47.960.950/0001-21': 'ABEV3',
-        '89.850.341/0001-60': 'BRAP4',
-        '02.558.157/0001-62': 'SUZB3',
-        '42.150.391/0001-70': 'JBSS3',
-        '02.919.555/0001-67': 'PRIO3',
-        '76.484.013/0001-45': 'EZTC3',
-        '08.534.605/0001-74': 'HYPE3',
-        '61.585.865/0001-51': 'CSNA3',
-    }
-    return {v: k for k, v in MANUAL_MAP.items()}  # ticker → CNPJ invertido pra busca
+def parse_date_br(text):
+    if not text:
+        return None
+    parts = text.strip().split("/")
+    if len(parts) == 3:
+        try:
+            return f"{parts[2]}-{parts[1]}-{parts[0]}"
+        except:
+            return None
+    return None
 
+# ============ CALCULATIONS ============
+def shares_at(operations, date):
+    total = 0
+    for op in operations:
+        if op.get("d", "") <= date:
+            total += op.get("q", 0)
+    return max(0, total)
+
+def process_dividends(all_events, operations):
+    dy_known = {}
+    monthly = {}
+    filtered = {}
+    
+    for tk, events in all_events.items():
+        ops = operations.get(tk, [])
+        relevant = []
+        ticker_total = 0
+        
+        for ev in events:
+            cotas = shares_at(ops, ev["dc"])
+            if cotas <= 0:
+                continue
+            valor = ev["r"] * cotas
+            relevant.append(ev)
+            ticker_total += valor
+            month = (ev.get("dp") or ev["dc"])[:7]
+            monthly[month] = monthly.get(month, 0) + valor
+        
+        if relevant:
+            filtered[tk] = relevant
+        if ticker_total > 0:
+            dy_known[tk] = round(ticker_total, 2)
+    
+    monthly_list = [
+        {"data": m, "total": round(v, 2)}
+        for m, v in sorted(monthly.items())
+        if v > 0.01
+    ]
+    return dy_known, monthly_list, filtered
+
+# ============ MAIN ============
 def main():
     print("=" * 60)
-    print(f"CVM Balanços — {datetime.now().isoformat()}")
+    print(f"Fetch Dividendos — {datetime.now().isoformat()}")
     print("=" * 60)
     
     db = init_firebase()
     
-    # Baixar dados dos últimos 3 anos
-    current_year = datetime.now().year
-    years = [current_year, current_year - 1, current_year - 2]
+    ativos = db.collection("investimentos").document("ativos").get()
+    if not ativos.exists:
+        print("Nenhum ativo."); return
     
-    all_dfs = {}
-    for year in years:
-        print(f"\n--- DFP {year} ---")
-        dfs = download_cvm_csv("DFP", year)
-        if dfs:
-            all_dfs[f"DFP_{year}"] = dfs
-        
-        print(f"\n--- ITR {year} ---")
-        dfs = download_cvm_csv("ITR", year)
-        if dfs:
-            all_dfs[f"ITR_{year}"] = dfs
+    lista = ativos.to_dict().get("lista", [])
+    carteira = [a for a in lista if a.get("s") == "C"]
     
-    if not all_dfs:
-        print("Nenhum dado obtido da CVM")
-        return
+    # Também buscar Wishlist que têm operações (ativos vendidos com DY pendente)
+    ops_doc = db.collection("investimentos").document("operacoes").get()
+    operations = ops_doc.to_dict() if ops_doc.exists else {}
     
-    # Extrair dados financeiros
+    wishlist_com_ops = [a for a in lista if a.get("s") == "W" and a["k"] in operations]
+    todos = carteira + wishlist_com_ops
+    
+    acoes = [a["k"] for a in todos if a.get("tp") == "AÇÕES"]
+    fiis = [a["k"] for a in todos if a.get("tp") == "FII"]
+    
+    print(f"Ações: {len(acoes)} (PlayInvest) — inclui {len([a for a in wishlist_com_ops if a.get('tp')=='AÇÕES'])} vendidos")
+    print(f"FIIs:  {len(fiis)} (Yahoo Finance) — inclui {len([a for a in wishlist_com_ops if a.get('tp')=='FII'])} vendidos")
+    
+    div_doc = db.collection("investimentos").document("dividendos").get()
+    existing_dy = div_doc.to_dict().get("dy_known", {}) if div_doc.exists else {}
+    
+    all_events = {}
+    
+    # --- AÇÕES ---
     print(f"\n{'='*40}")
-    print("Processando balanços...")
-    companies = extract_financials(all_dfs)
-    print(f"Empresas encontradas: {len(companies)}")
+    print("AÇÕES — PlayInvest")
+    print(f"{'='*40}")
+    ok_a = 0
+    for i, tk in enumerate(acoes):
+        print(f"[{i+1}/{len(acoes)}] {tk}...", end="", flush=True)
+        ev = fetch_playinvest(tk)
+        if ev:
+            all_events[tk] = ev
+            ok_a += 1
+            print(f" ✓ {len(ev)} eventos")
+        else:
+            print(f" ✗")
+        time.sleep(DELAY)
     
-    # Mapear CNPJ → ticker (simplificado)
-    # Na prática, usamos os tickers do fundamentos no Firestore
-    fund_doc = db.collection("investimentos").document("fundamentos").get()
-    fund_data = fund_doc.to_dict() if fund_doc.exists else {}
+    # --- FIIs ---
+    print(f"\n{'='*40}")
+    print("FIIs — Yahoo Finance")
+    print(f"{'='*40}")
+    ok_f = 0
+    for i, tk in enumerate(fiis):
+        print(f"[{i+1}/{len(fiis)}] {tk}...", end="", flush=True)
+        ev = fetch_yahoo_fii(tk)
+        if ev:
+            all_events[tk] = ev
+            ok_f += 1
+            print(f" ✓ {len(ev)} eventos")
+        else:
+            print(f" ✗")
+        time.sleep(1)
     
-    # Criar mapa reverso: tentar mapear pelo nome da empresa
-    ticker_map = {}
-    for cnpj, data in companies.items():
-        nome_cvm = data['nome'].upper()
-        for tk, fund in fund_data.items():
-            if isinstance(fund, dict) and fund.get('name'):
-                nome_fund = fund['name'].upper()
-                # Match parcial pelo nome
-                if (nome_cvm[:15] in nome_fund or nome_fund[:15] in nome_cvm or
-                    tk in nome_cvm.replace(' ', '')):
-                    ticker_map[cnpj] = tk
-                    break
+    print(f"\nFetch: Ações {ok_a}/{len(acoes)}, FIIs {ok_f}/{len(fiis)}")
     
-    print(f"Tickers mapeados: {len(ticker_map)}")
+    # --- Process ---
+    print(f"\n{'='*40}")
+    print("Calculando DY × sharesAt()...")
+    print(f"{'='*40}")
+    dy_known, monthly, filtered = process_dividends(all_events, operations)
     
-    # Calcular métricas
-    results = calculate_metrics(companies, ticker_map)
-    print(f"Análises geradas: {len(results)}")
+    # Keep existing for failed tickers
+    for tk, val in existing_dy.items():
+        if tk not in dy_known:
+            dy_known[tk] = val
     
-    # Salvar no Firestore
-    if results:
-        results['ultimaAtualizacao'] = datetime.now().isoformat()
-        db.collection("investimentos").document("balancos").set(results)
-        print(f"✓ Salvo no Firestore: {len(results)-1} empresas")
-        
-        # Resumo
-        for tk in sorted(results.keys()):
-            if tk == 'ultimaAtualizacao':
-                continue
-            r = results[tk]
-            print(f"  {tk}: ROE={r.get('roe',0)}% ML={r.get('margem_liquida',0)}% D/PL={r.get('divida_pl',0)} Rec={r.get('receita_mm',0)}MM")
+    total = sum(dy_known.values())
+    print(f"Total DY: R$ {total:.2f} ({len(dy_known)} tickers, {len(monthly)} meses)")
+    
+    # --- Save ---
+    db.collection("investimentos").document("dividendos").set({
+        "dy_known": dy_known,
+        "mensal": monthly,
+        "eventos": filtered,
+        "ultimaAtualizacao": datetime.now().isoformat(),
+        "fonte": "PlayInvest (ações) + Yahoo Finance (FIIs)"
+    })
+    print("✓ Firestore salvo!")
+    
+    # === FUNDAMENTAIS via yfinance — TODOS os tickers da B3 ===
+    print(f"\n{'='*60}")
+    print("Buscando fundamentos de TODOS os tickers B3 (yfinance)...")
+    print(f"{'='*60}")
+    
+    # Lista abrangente: Ibovespa + SmallCaps + FIIs + ETFs
+    B3_TICKERS = [
+        # Ibovespa
+        'ABEV3','ALPA4','ALOS3','ARZZ3','ASAI3','AZUL4','B3SA3','BBAS3','BBDC3','BBDC4',
+        'BBSE3','BEEF3','BPAC11','BRAP4','BRFS3','BRKM5','CASH3','CCRO3','CIEL3','CMIG4',
+        'CMIN3','COGN3','CPFE3','CPLE6','CRFB3','CSAN3','CSNA3','CVCB3','CYRE3','DXCO3',
+        'ECOR3','EGIE3','ELET3','ELET6','EMBR3','ENEV3','ENGI11','EQTL3','EZTC3','FLRY3',
+        'GGBR4','GOAU4','GOLL4','HAPV3','HYPE3','IGTI11','IRBR3','ITSA4','ITUB4','JBSS3',
+        'KLBN11','KLBN4','LREN3','LWSA3','MGLU3','MRFG3','MRVE3','MULT3','NTCO3','PCAR3',
+        'PETR3','PETR4','PETZ3','POSI3','PRIO3','QUAL3','RADL3','RAIL3','RAIZ4','RCSL3',
+        'RDOR3','RENT3','RRRP3','SANB11','SBSP3','SLCE3','SMTO3','SOMA3','SUZB3','TAEE11',
+        'TIMS3','TOTS3','UGPA3','USIM5','VALE3','VBBR3','VIVT3','WEGE3','YDUQ3',
+        # SmallCaps populares
+        'ABCB4','ALSO3','AURE3','BMGB4','BOAS3','BRSR6','CAML3','CBAV3','CEAB3','CGAS5',
+        'CLSA3','CPLE3','CSMG3','DIRR3','DMMO3','ELMD3','ENBR3','EVEN3','FESA4','FIQE3',
+        'GRND3','HBSA3','INTB3','ISAE4','JHSF3','KEPL3','LAVV3','LEVE3','LJQQ3','LOGG3',
+        'MDIA3','MEGA3','MLAS3','MOVI3','MTRE3','MYPK3','NEOE3','ODPV3','OIBR3','PARD3',
+        'PGMN3','PINE4','PLPL3','POMO4','PTBL3','RAPT4','RECV3','RNEW4','ROMI3','RSUL4',
+        'SAPR11','SBFG3','SEER3','SIMH3','SMFT3','SOJA3','SQIA3','STBP3','TASA4','TGMA3',
+        'TRIS3','TUPY3','UNIP6','VAMO3','VIIA3','VLID3','VULC3','WIZC3',
+        # FIIs populares
+        'BCFF11','BTLG11','CPTS11','DEVA11','GGRC11','HGBS11','HGCR11','HGLG11','HGRE11',
+        'HGRU11','HSML11','IRDM11','JSRE11','KNCR11','KNIP11','KNRI11','LVBI11','MXRF11',
+        'PVBI11','RBRF11','RBRR11','RECR11','RZAK11','RZAT11','RZTR11','SNEL11','TGAR11',
+        'TRXF11','TVRI11','URPR11','VISC11','VGIP11','VILG11','XPLG11','XPML11',
+        # ETFs
+        'BOVA11','IVVB11','SMAL11','HASH11','GOLD11','SPXI11','DIVO11',
+    ]
+    
+    # Adicionar tickers da carteira/wishlist que não estejam na lista
+    for a in lista:
+        tk = a.get("k","")
+        if tk and tk not in B3_TICKERS and tk not in ('USDBRL','BTCBRL','ETHBRL'):
+            B3_TICKERS.append(tk)
+    
+    B3_TICKERS = sorted(set(B3_TICKERS))
+    print(f"Total: {len(B3_TICKERS)} tickers")
+    
+    fundamentos = {}
+    existing_fund_doc = db.collection("investimentos").document("fundamentos").get()
+    existing_fund = existing_fund_doc.to_dict() if existing_fund_doc.exists else {}
+    
+    ok_fund = 0
+    for i, tk in enumerate(B3_TICKERS):
+        if (i+1) % 20 == 0 or i == 0:
+            print(f"[{i+1}/{len(B3_TICKERS)}]", end="", flush=True)
+        try:
+            ytk = yf.Ticker(f"{tk}.SA")
+            info = ytk.info or {}
+            
+            pl = info.get('trailingPE') or info.get('forwardPE') or 0
+            pvp = info.get('priceToBook') or 0
+            dy = info.get('dividendYield') or info.get('trailingAnnualDividendYield') or 0
+            lpa = info.get('trailingEps') or 0
+            vpa = info.get('bookValue') or 0
+            price = info.get('regularMarketPrice') or info.get('currentPrice') or 0
+            name = info.get('longName') or info.get('shortName') or tk
+            sector = info.get('sector') or info.get('industry') or ''
+            
+            if pl or pvp or price:
+                fundamentos[tk] = {
+                    'pl': round(pl, 2) if pl else 0,
+                    'pvp': round(pvp, 2) if pvp else 0,
+                    'dy': round(dy * 100, 2) if dy and dy < 1 else round(dy, 2) if dy else 0,
+                    'lpa': round(lpa, 2) if lpa else 0,
+                    'vpa': round(vpa, 2) if vpa else 0,
+                    'price': round(price, 2) if price else 0,
+                    'name': name,
+                    'sector': sector
+                }
+                ok_fund += 1
+        except Exception as e:
+            pass
+        time.sleep(0.8)
+    
+    print(f"\nFundamentos: {ok_fund}/{len(B3_TICKERS)} OK")
+    
+    fundamentos['ultimaAtualizacao'] = datetime.now().isoformat()
+    
+    # Firestore doc tem limite de 1MB — verificar tamanho
+    import sys
+    fund_size = sys.getsizeof(json.dumps(fundamentos))
+    print(f"Tamanho: {fund_size/1024:.1f} KB")
+    
+    db.collection("investimentos").document("fundamentos").set(fundamentos)
+    print(f"✓ Fundamentos salvos: {ok_fund} tickers")
+    
+    # --- Detail ---
+    print(f"\n{'='*40}")
+    print("Resumo Dividendos")
+    print(f"{'='*40}")
+    print(f"\n{'='*40}")
+    for tk in sorted(dy_known.keys()):
+        n = len(filtered.get(tk, []))
+        src = "PI" if tk in acoes else "YF" if tk in fiis else "?"
+        print(f"  {tk}: R$ {dy_known[tk]:.2f} ({n} ev) [{src}]")
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,27 @@
+name: Fetch Balanços CVM
+
+on:
+  schedule:
+    # Roda toda segunda às 10:00 UTC (07:00 BRT)
+    - cron: '0 10 * * 1'
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas firebase-admin
+
+      - name: Fetch balanços CVM
+        env:
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+        run: python scripts/fetch_balancos.py

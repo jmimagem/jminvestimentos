@@ -36,7 +36,15 @@ def download_cvm_csv(doc_type, year):
         dfs = {}
         for name in zf.namelist():
             if name.endswith('.csv'):
-                key = name.split('_cia_aberta_')[0].split('/')[-1].upper()
+                # Extrair tipo: dfp_cia_aberta_DRE_con_2024.csv → DRE_CON
+                parts = name.split('_cia_aberta_')
+                if len(parts) > 1:
+                    key = parts[1].replace('.csv', '').upper()
+                    # Remover o ano do final: DRE_CON_2024 → DRE_CON
+                    for y in ['_2024', '_2025', '_2026', '_2027']:
+                        key = key.replace(y, '')
+                else:
+                    key = name.replace('.csv', '').upper()
                 try:
                     df = pd.read_csv(zf.open(name), sep=';', encoding='latin-1', 
                                      dtype=str, on_bad_lines='skip')
@@ -54,8 +62,10 @@ def extract_financials(dfs_by_year):
     companies = {}  # {CNPJ: {nome, dados por periodo}}
     
     for year, dfs in dfs_by_year.items():
-        # DRE - Demonstração de Resultado
-        dre_key = [k for k in dfs.keys() if 'DRE' in k]
+        # DRE - Demonstração de Resultado (consolidado primeiro, individual como fallback)
+        dre_key = [k for k in dfs.keys() if 'DRE' in k and 'CON' in k]
+        if not dre_key:
+            dre_key = [k for k in dfs.keys() if 'DRE' in k]
         if dre_key:
             df = dfs[dre_key[0]]
             # Filtrar consolidado (ORDEM_EXERC=ÚLTIMO, GRUPO_DFP=DF Consolidado)
@@ -95,7 +105,9 @@ def extract_financials(dfs_by_year):
                     companies[cnpj]['periodos'][dt_ref]['ebit'] = valor
         
         # BPP - Balanço Patrimonial Passivo (Patrimônio Líquido)
-        bpp_key = [k for k in dfs.keys() if 'BPP' in k]
+        bpp_key = [k for k in dfs.keys() if 'BPP' in k and 'CON' in k]
+        if not bpp_key:
+            bpp_key = [k for k in dfs.keys() if 'BPP' in k]
         if bpp_key:
             df = dfs[bpp_key[0]]
             if 'ORDEM_EXERC' in df.columns:
@@ -129,7 +141,9 @@ def extract_financials(dfs_by_year):
                     companies[cnpj]['periodos'][dt_ref]['passivo_nao_circulante'] = valor
         
         # BPA - Balanço Patrimonial Ativo
-        bpa_key = [k for k in dfs.keys() if 'BPA' in k]
+        bpa_key = [k for k in dfs.keys() if 'BPA' in k and 'CON' in k]
+        if not bpa_key:
+            bpa_key = [k for k in dfs.keys() if 'BPA' in k]
         if bpa_key:
             df = dfs[bpa_key[0]]
             if 'ORDEM_EXERC' in df.columns:

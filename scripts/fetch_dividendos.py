@@ -53,9 +53,80 @@ def fetch_playinvest(ticker):
         print(f"    PlayInvest erro: {e}")
         return []
 
-# ============ YAHOO FINANCE (FIIs) ============
+# ============ INVESTIDOR10 (FIIs + ETFs — tem data com E data pagamento) ============
+def fetch_investidor10(ticker, tipo="fiis"):
+    """Busca dividendos do investidor10.com.br — retorna data com E data pagamento."""
+    url = f"https://investidor10.com.br/{tipo}/{ticker.lower()}/"
+    try:
+        resp = requests.get(url, headers={**HEADERS, "Referer": "https://investidor10.com.br/"}, timeout=15)
+        if resp.status_code != 200:
+            return []
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        divs = []
+        
+        # Procurar tabela de proventos/rendimentos
+        tables = soup.find_all("table")
+        for table in tables:
+            headers_text = [th.get_text(strip=True).upper() for th in table.find_all("th")]
+            # Identificar tabela com colunas de dividendos
+            has_data_com = any("COM" in h or "BASE" in h for h in headers_text)
+            has_valor = any("VALOR" in h or "R$" in h for h in headers_text)
+            
+            if not (has_data_com and has_valor):
+                continue
+            
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                
+                # Tentar extrair: tipo, data com, data pgto, valor
+                texts = [c.get_text(strip=True) for c in cells]
+                
+                dc = None
+                dp = None
+                rate = 0
+                label = "RENDIMENTO"
+                
+                for txt in texts:
+                    # Detectar datas (DD/MM/YYYY)
+                    if "/" in txt and len(txt) >= 8:
+                        parsed = parse_date_br(txt)
+                        if parsed:
+                            if not dc:
+                                dc = parsed
+                            elif not dp:
+                                dp = parsed
+                    # Detectar valor monetário
+                    elif txt.replace(",", "").replace(".", "").replace("R$", "").replace(" ", "").replace("-","").isdigit() or \
+                         any(c.isdigit() for c in txt):
+                        try:
+                            val = float(txt.replace("R$", "").replace(" ", "").replace(".", "").replace(",", "."))
+                            if 0 < val < 100:  # valor por cota razoável
+                                rate = val
+                        except:
+                            pass
+                    # Detectar tipo
+                    elif txt.upper() in ("DIVIDENDO", "JCP", "RENDIMENTO", "JSCP"):
+                        label = txt.upper()
+                
+                if dc and rate > 0:
+                    divs.append({
+                        "dc": dc,
+                        "dp": dp or estimate_payment_date(dc, 10),
+                        "r": round(rate, 6),
+                        "l": label
+                    })
+        
+        return divs
+    except Exception as e:
+        print(f"    Investidor10 erro: {e}")
+        return []
+
+# ============ YAHOO FINANCE (fallback FIIs) ============
 def fetch_yahoo_fii(ticker):
-    """Busca dividendos de FIIs via yfinance."""
+    """Busca dividendos de FIIs via yfinance (fallback se investidor10 falhar)."""
     try:
         tk = yf.Ticker(f"{ticker}.SA")
         divs_df = tk.dividends
@@ -65,11 +136,10 @@ def fetch_yahoo_fii(ticker):
         result = []
         for date, amount in divs_df.items():
             if amount > 0:
-                # yfinance retorna a ex-date como index
                 dc = date.strftime("%Y-%m-%d")
                 result.append({
                     "dc": dc,
-                    "dp": dc,  # Yahoo não dá data de pagamento separada
+                    "dp": estimate_payment_date(dc, 10),  # +10 dias úteis
                     "r": round(float(amount), 6),
                     "l": "RENDIMENTO"
                 })
@@ -88,6 +158,20 @@ def parse_date_br(text):
         except:
             return None
     return None
+
+def estimate_payment_date(data_com, business_days=10):
+    """Estima data de pagamento: data com + N dias úteis."""
+    try:
+        from datetime import timedelta
+        dt = datetime.strptime(data_com, "%Y-%m-%d")
+        count = 0
+        while count < business_days:
+            dt += timedelta(days=1)
+            if dt.weekday() < 5:  # seg-sex
+                count += 1
+        return dt.strftime("%Y-%m-%d")
+    except:
+        return data_com
 
 # ============ CALCULATIONS ============
 def shares_at(operations, date):
@@ -153,9 +237,11 @@ def main():
     
     acoes = [a["k"] for a in todos if a.get("tp") == "AÇÕES"]
     fiis = [a["k"] for a in todos if a.get("tp") == "FII"]
+    etfs = [a["k"] for a in todos if a.get("tp") == "ETF"]
     
-    print(f"Ações: {len(acoes)} (PlayInvest) — inclui {len([a for a in wishlist_com_ops if a.get('tp')=='AÇÕES'])} vendidos")
-    print(f"FIIs:  {len(fiis)} (Yahoo Finance) — inclui {len([a for a in wishlist_com_ops if a.get('tp')=='FII'])} vendidos")
+    print(f"Ações: {len(acoes)} (PlayInvest)")
+    print(f"FIIs:  {len(fiis)} (Investidor10 → Yahoo fallback)")
+    print(f"ETFs:  {len(etfs)} (Investidor10)")
     
     div_doc = db.collection("investimentos").document("dividendos").get()
     existing_dy = div_doc.to_dict().get("dy_known", {}) if div_doc.exists else {}
@@ -178,23 +264,54 @@ def main():
             print(f" ✗")
         time.sleep(DELAY)
     
-    # --- FIIs ---
+    # --- FIIs (investidor10 primeiro, Yahoo fallback) ---
     print(f"\n{'='*40}")
-    print("FIIs — Yahoo Finance")
+    print("FIIs — Investidor10 → Yahoo Finance fallback")
     print(f"{'='*40}")
     ok_f = 0
     for i, tk in enumerate(fiis):
         print(f"[{i+1}/{len(fiis)}] {tk}...", end="", flush=True)
-        ev = fetch_yahoo_fii(tk)
+        # Tentar investidor10 primeiro (tem data com + data pagamento)
+        ev = fetch_investidor10(tk, "fiis")
         if ev:
             all_events[tk] = ev
             ok_f += 1
+            print(f" ✓ {len(ev)} eventos [inv10]")
+        else:
+            # Fallback: Yahoo Finance (+10 dias úteis estimados)
+            ev = fetch_yahoo_fii(tk)
+            if ev:
+                all_events[tk] = ev
+                ok_f += 1
+                print(f" ✓ {len(ev)} eventos [yahoo]")
+            else:
+                print(f" ✗")
+        time.sleep(DELAY)
+    
+    # --- ETFs (investidor10) ---
+    print(f"\n{'='*40}")
+    print("ETFs — Investidor10")
+    print(f"{'='*40}")
+    ok_e = 0
+    for i, tk in enumerate(etfs):
+        print(f"[{i+1}/{len(etfs)}] {tk}...", end="", flush=True)
+        ev = fetch_investidor10(tk, "etfs")
+        if ev:
+            all_events[tk] = ev
+            ok_e += 1
             print(f" ✓ {len(ev)} eventos")
         else:
-            print(f" ✗")
-        time.sleep(1)
+            # Tentar como ação (alguns ETFs estão em /acoes/)
+            ev = fetch_investidor10(tk, "acoes")
+            if ev:
+                all_events[tk] = ev
+                ok_e += 1
+                print(f" ✓ {len(ev)} eventos [acoes]")
+            else:
+                print(f" ✗")
+        time.sleep(DELAY)
     
-    print(f"\nFetch: Ações {ok_a}/{len(acoes)}, FIIs {ok_f}/{len(fiis)}")
+    print(f"\nFetch: Ações {ok_a}/{len(acoes)}, FIIs {ok_f}/{len(fiis)}, ETFs {ok_e}/{len(etfs)}")
     
     # --- Process ---
     print(f"\n{'='*40}")

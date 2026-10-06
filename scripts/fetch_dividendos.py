@@ -47,7 +47,7 @@ def fetch_playinvest(ticker):
             except:
                 continue
             if dc and rate > 0:
-                divs.append({"dc": dc, "dp": dp or dc, "r": rate, "l": tipo})
+                divs.append({"dc": dc, "dp": dp or "", "r": rate, "l": tipo})
         return divs
     except Exception as e:
         print(f"    PlayInvest erro: {e}")

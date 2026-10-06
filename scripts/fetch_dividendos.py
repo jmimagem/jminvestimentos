@@ -429,6 +429,48 @@ def main():
     db.collection("investimentos").document("fundamentos").set(fundamentos)
     print(f"✓ Fundamentos salvos: {ok_fund} tickers")
     
+    # === SPARKLINES — 30 dias de preços ===
+    print(f"\n{'='*40}")
+    print("Buscando sparklines (30 dias)...")
+    print(f"{'='*40}")
+    
+    # Apenas tickers da carteira + wishlist com operações (não todos os 250)
+    spark_tickers = [a["k"] for a in lista if a["k"] not in ('USDBRL','BTCBRL','ETHBRL')]
+    sparklines = {}
+    ok_spark = 0
+    
+    for i, tk in enumerate(spark_tickers):
+        try:
+            ytk = yf.Ticker(f"{tk}.SA")
+            hist = ytk.history(period="1mo")
+            if hist is not None and not hist.empty and 'Close' in hist.columns:
+                prices = [round(float(p), 2) for p in hist['Close'].tolist()]
+                if len(prices) >= 5:
+                    sparklines[tk] = prices
+                    ok_spark += 1
+        except:
+            pass
+        if (i+1) % 10 == 0:
+            print(f"  [{i+1}/{len(spark_tickers)}]", end="", flush=True)
+        time.sleep(0.5)
+    
+    # Crypto separado (sem .SA)
+    for tk in ['USDBRL','BTCBRL','ETHBRL']:
+        if any(a["k"] == tk for a in lista):
+            try:
+                pair = tk[:3] + '-' + tk[3:]  # BTC-BRL
+                ytk = yf.Ticker(pair)
+                hist = ytk.history(period="1mo")
+                if hist is not None and not hist.empty and 'Close' in hist.columns:
+                    sparklines[tk] = [round(float(p), 2) for p in hist['Close'].tolist()]
+                    ok_spark += 1
+            except:
+                pass
+    
+    sparklines['ultimaAtualizacao'] = datetime.now().isoformat()
+    db.collection("investimentos").document("sparklines").set(sparklines)
+    print(f"\n✓ Sparklines salvos: {ok_spark} tickers")
+    
     # --- Detail ---
     print(f"\n{'='*40}")
     print("Resumo Dividendos")

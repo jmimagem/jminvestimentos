@@ -243,157 +243,160 @@ def calculate_metrics(companies, ticker_map):
     
     return results
 
+def normalize_name(name):
+    """Remove sufixos, pontuação e normaliza nome de empresa."""
+    import re
+    n = name.upper().strip()
+    # Remover sufixos jurídicos
+    for suf in [' S.A.', ' S/A', ' SA', ' S.A', ' LTDA', ' LTDA.', ' - EM RECUPERACAO JUDICIAL',
+                ' - EM REC. JUDICIAL', ' CIA.', ' CIA', ' HOLDING', ' PARTICIPACOES', ' PART.']:
+        n = n.replace(suf, '')
+    n = re.sub(r'[.\-/,()]', ' ', n)
+    n = re.sub(r'\s+', ' ', n).strip()
+    return n
+
 def build_ticker_map(companies):
-    """Mapeia CNPJ → ticker usando cadastro CVM + nome da empresa."""
+    """Mapeia CNPJ → ticker usando cadastro CVM + yfinance + fuzzy matching."""
     
-    # Mapa manual expandido: CNPJ → ticker (principais empresas B3)
+    # 1. Carregar cadastro CVM
+    cad_names = {}  # CNPJ prefix → nome comercial
+    try:
+        print("  Baixando cadastro CVM...")
+        cad_url = "https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"
+        cad_df = pd.read_csv(cad_url, sep=';', encoding='latin-1', dtype=str)
+        for _, row in cad_df.iterrows():
+            cnpj = str(row.get('CNPJ_CIA', '')).strip()
+            sit = str(row.get('SIT_REG', '')).strip()
+            if cnpj and sit == 'ATIVO':
+                social = normalize_name(str(row.get('DENOM_SOCIAL', '')))
+                comercial = normalize_name(str(row.get('DENOM_COMERC', '')))
+                cad_names[cnpj[:10]] = {'social': social, 'comercial': comercial}
+        print(f"  Cadastro CVM: {len(cad_names)} empresas ativas")
+    except Exception as e:
+        print(f"  Erro cadastro: {e}")
+    
+    # 2. Carregar nomes do yfinance (Firestore fundamentos)
+    fund_names = {}  # ticker → nome normalizado
+    try:
+        fund_doc = db.collection("investimentos").document("fundamentos").get()
+        if fund_doc.exists:
+            for tk, data in fund_doc.to_dict().items():
+                if isinstance(data, dict) and data.get('name'):
+                    fund_names[tk] = normalize_name(data['name'])
+        print(f"  Fundamentos yfinance: {len(fund_names)} tickers")
+    except:
+        pass
+    
+    # 3. Mapa manual CNPJ prefix → ticker
     CNPJ_MAP = {
-        '33.000.167': 'PETR4',  # Petrobras
-        '00.000.000': 'BBAS3',  # Banco do Brasil
-        '60.746.948': 'BBDC4',  # Bradesco
-        '60.872.504': 'ITUB4',  # Itau Unibanco
-        '61.532.644': 'ITSA4',  # Itausa
-        '33.592.510': 'VALE3',  # Vale
-        '84.429.695': 'WEGE3',  # WEG
-        '02.916.265': 'B3SA3',  # B3
-        '33.611.500': 'ELET3',  # Eletrobras
-        '20.706.413': 'CMIG4',  # Cemig
-        '76.535.764': 'CPLE6',  # Copel
-        '47.960.950': 'ABEV3',  # Ambev
-        '89.850.341': 'BRAP4',  # Bradespar
-        '02.558.157': 'SUZB3',  # Suzano
-        '42.150.391': 'JBSS3',  # JBS
-        '02.919.555': 'PRIO3',  # PetroRio/PRIO
-        '76.484.013': 'EZTC3',  # EZTEC
-        '08.534.605': 'HYPE3',  # Hypera
-        '61.585.865': 'CSNA3',  # CSN
-        '04.034.187': 'PETR3',  # Petrobras ON
-        '01.838.723': 'BBDC3',  # Bradesco ON
-        '33.041.260': 'VBBR3',  # Vibra Energia
-        '07.526.557': 'RENT3',  # Localiza
-        '02.328.280': 'CCRO3',  # CCR
-        '04.088.208': 'SBSP3',  # Sabesp
-        '60.894.730': 'SANB11', # Santander
-        '76.622.217': 'SBFG3',  # Grupo SBF
-        '92.754.738': 'SLCE3',  # SLC Agrícola
-        '87.456.562': 'ALOS3',  # Allos
-        '02.474.103': 'TIMS3',  # TIM
-        '02.429.144': 'VIVT3',  # Vivo/Telefonica
-        '60.850.229': 'LREN3',  # Lojas Renner
-        '47.508.411': 'HAPV3',  # Hapvida
-        '02.800.026': 'RDOR3',  # Rede D'Or
-        '01.532.247': 'PCAR3',  # Pão de Açúcar
-        '13.574.594': 'MGLU3',  # Magazine Luiza
-        '08.181.508': 'FLRY3',  # Fleury
-        '04.310.392': 'MULT3',  # Multiplan
-        '02.388.668': 'ENEV3',  # Eneva
-        '03.220.438': 'EQTL3',  # Equatorial
-        '15.527.906': 'ENGI11', # Energisa
-        '06.981.180': 'CMIN3',  # CSN Mineração
-        '14.011.962': 'AZUL4',  # Azul
-        '07.689.002': 'RAIL3',  # Rumo
-        '34.274.233': 'BRFS3',  # BRF
-        '23.637.428': 'CRFB3',  # Carrefour
-        '61.412.110': 'RADL3',  # Raia Drogasil
-        '08.886.098': 'ASAI3',  # Assaí
-        '73.178.600': 'CYRE3',  # Cyrela
-        '07.628.528': 'COGN3',  # Cogna
-        '04.065.791': 'CPFE3',  # CPFL
-        '43.776.517': 'IGTI11', # Iguatemi
-        '04.423.567': 'UGPA3',  # Ultrapar
-        '23.865.067': 'YDUQ3',  # Yduqs
-        '60.148.154': 'ECOR3',  # Ecorodovias
-        '16.404.287': 'DXCO3',  # Dexco
-        '02.762.115': 'MRVE3',  # MRV
-        '97.837.181': 'GOAU4',  # Metalúrgica Gerdau
-        '33.613.286': 'GGBR4',  # Gerdau
-        '07.170.938': 'CASH3',  # Méliuz
-        '08.063.988': 'LWSA3',  # LWSA
-        '10.346.185': 'CVCB3',  # CVC
-        '91.826.310': 'SMTO3',  # São Martinho
-        '89.637.490': 'BRKM5',  # Braskem
-        '04.184.779': 'CSAN3',  # Cosan
-        '07.516.534': 'BEEF3',  # Minerva
-        '09.346.601': 'RRRP3',  # 3R Petroleum
-        '06.980.064': 'MRFG3',  # Marfrig
-        '11.237.486': 'ALPA4',  # Alpargatas
-        '02.302.101': 'IRBR3',  # IRB
-        '76.487.032': 'KLBN11', # Klabin
-        '89.073.104': 'KLBN4',  # Klabin
-        '56.720.428': 'NTCO3',  # Natura
-        '03.847.461': 'GOLL4',  # Gol
-        '28.757.546': 'TOTS3',  # TOTVS
-        '50.746.577': 'TAEE11', # Taesa
-        '92.660.007': 'PETZ3',  # Petz/Cobasi
-        '82.508.433': 'FESA4',  # Ferbasa
-        '79.739.440': 'MYPK3',  # Iochpe-Maxion
-        '44.990.901': 'ROMI3',  # Romi
-        '88.610.126': 'GRND3',  # Grendene
-        '81.423.838': 'POMO4',  # Marcopolo
-        '12.644.536': 'SOJA3',  # Boa Safra
-        '07.318.783': 'ABCB4',  # ABC Brasil
-        '92.702.067': 'BRSR6',  # Banrisul
-        '15.141.799': 'CAML3',  # Camil
-        '30.306.294': 'BMGB4',  # BMG
-        '33.014.556': 'ISAE4',  # ISA CTEEP
-        '61.856.571': 'EGIE3',  # Engie
-        '86.375.425': 'MTRE3',  # Mitre
-        '80.659.624': 'TRIS3',  # Trisul
-        '14.810.028': 'FIQE3',  # Unifique
-        '60.651.809': 'CIEL3',  # Cielo
-        '10.347.985': 'SOMA3',  # Grupo Soma
-        '04.738.023': 'USIM5',  # Usiminas
-        '47.427.653': 'BBSE3',  # BB Seguridade
+        '33.000.167': 'PETR4', '00.000.000': 'BBAS3', '60.746.948': 'BBDC4',
+        '60.872.504': 'ITUB4', '61.532.644': 'ITSA4', '33.592.510': 'VALE3',
+        '84.429.695': 'WEGE3', '02.916.265': 'B3SA3', '33.611.500': 'ELET3',
+        '20.706.413': 'CMIG4', '76.535.764': 'CPLE6', '47.960.950': 'ABEV3',
+        '89.850.341': 'BRAP4', '02.558.157': 'SUZB3', '42.150.391': 'JBSS3',
+        '02.919.555': 'PRIO3', '76.484.013': 'EZTC3', '08.534.605': 'HYPE3',
+        '61.585.865': 'CSNA3', '33.041.260': 'VBBR3', '07.526.557': 'RENT3',
+        '02.328.280': 'CCRO3', '04.088.208': 'SBSP3', '60.894.730': 'SANB11',
+        '92.754.738': 'SLCE3', '87.456.562': 'ALOS3', '02.474.103': 'TIMS3',
+        '02.429.144': 'VIVT3', '60.850.229': 'LREN3', '47.508.411': 'HAPV3',
+        '02.800.026': 'RDOR3', '01.532.247': 'PCAR3', '13.574.594': 'MGLU3',
+        '08.181.508': 'FLRY3', '04.310.392': 'MULT3', '02.388.668': 'ENEV3',
+        '03.220.438': 'EQTL3', '15.527.906': 'ENGI11', '06.981.180': 'CMIN3',
+        '14.011.962': 'AZUL4', '07.689.002': 'RAIL3', '34.274.233': 'BRFS3',
+        '23.637.428': 'CRFB3', '61.412.110': 'RADL3', '08.886.098': 'ASAI3',
+        '73.178.600': 'CYRE3', '07.628.528': 'COGN3', '04.065.791': 'CPFE3',
+        '43.776.517': 'IGTI11', '04.423.567': 'UGPA3', '23.865.067': 'YDUQ3',
+        '60.148.154': 'ECOR3', '16.404.287': 'DXCO3', '02.762.115': 'MRVE3',
+        '97.837.181': 'GOAU4', '33.613.286': 'GGBR4', '07.170.938': 'CASH3',
+        '08.063.988': 'LWSA3', '10.346.185': 'CVCB3', '91.826.310': 'SMTO3',
+        '89.637.490': 'BRKM5', '04.184.779': 'CSAN3', '07.516.534': 'BEEF3',
+        '09.346.601': 'RRRP3', '06.980.064': 'MRFG3', '11.237.486': 'ALPA4',
+        '02.302.101': 'IRBR3', '76.487.032': 'KLBN11', '56.720.428': 'NTCO3',
+        '03.847.461': 'GOLL4', '28.757.546': 'TOTS3', '50.746.577': 'TAEE11',
+        '82.508.433': 'FESA4', '79.739.440': 'MYPK3', '44.990.901': 'ROMI3',
+        '88.610.126': 'GRND3', '81.423.838': 'POMO4', '12.644.536': 'SOJA3',
+        '07.318.783': 'ABCB4', '92.702.067': 'BRSR6', '15.141.799': 'CAML3',
+        '30.306.294': 'BMGB4', '33.014.556': 'ISAE4', '61.856.571': 'EGIE3',
+        '86.375.425': 'MTRE3', '80.659.624': 'TRIS3', '14.810.028': 'FIQE3',
+        '60.651.809': 'CIEL3', '10.347.985': 'SOMA3', '04.738.023': 'USIM5',
+        '47.427.653': 'BBSE3', '76.622.217': 'SBFG3', '92.660.007': 'PETZ3',
+        '89.073.104': 'KLBN4',
     }
     
-    # Mapear empresas CVM por CNPJ (primeiros 10 dígitos)
+    # 4. Mapear: CNPJ manual → nome CVM vs yfinance → fuzzy
     ticker_map = {}
     mapped_tickers = set()
     
     for cnpj, data in companies.items():
         cnpj_prefix = cnpj[:10] if len(cnpj) >= 10 else cnpj
+        nome_cvm = normalize_name(data['nome'])
         
-        # Tentar match por CNPJ
+        # Passo 1: CNPJ manual direto
         for prefix, ticker in CNPJ_MAP.items():
             if cnpj.startswith(prefix) and ticker not in mapped_tickers:
                 ticker_map[cnpj] = ticker
                 mapped_tickers.add(ticker)
                 break
+        if cnpj in ticker_map:
+            continue
         
-        # Se não achou por CNPJ, tentar por nome
-        if cnpj not in ticker_map:
-            nome = data['nome'].upper().strip()
-            nome_clean = nome.replace('.','').replace('-','').replace('/','').replace('S A','').replace('S/A','').strip()
-            
-            # Match por palavras-chave no nome
-            NAME_MAP = {
-                'PETROBRAS': 'PETR4', 'BANCO DO BRASIL': 'BBAS3', 'BRADESCO': 'BBDC4',
-                'ITAU UNIBANCO': 'ITUB4', 'ITAUSA': 'ITSA4', 'VALE': 'VALE3',
-                'WEG': 'WEGE3', 'AMBEV': 'ABEV3', 'SUZANO': 'SUZB3',
-                'ELETROBRAS': 'ELET3', 'CEMIG': 'CMIG4', 'COPEL': 'CPLE6',
-                'LOCALIZA': 'RENT3', 'SABESP': 'SBSP3', 'LOJAS RENNER': 'LREN3',
-                'MAGAZINE LUIZA': 'MGLU3', 'FLEURY': 'FLRY3', 'MULTIPLAN': 'MULT3',
-                'EQUATORIAL': 'EQTL3', 'CYRELA': 'CYRE3', 'ULTRAPAR': 'UGPA3',
-                'GERDAU': 'GGBR4', 'KLABIN': 'KLBN11', 'NATURA': 'NTCO3',
-                'TOTVS': 'TOTS3', 'MARCOPOLO': 'POMO4', 'GRENDENE': 'GRND3',
-                'FERBASA': 'FESA4', 'ROMI': 'ROMI3', 'CAMIL': 'CAML3',
-                'BANRISUL': 'BRSR6', 'TRISUL': 'TRIS3', 'MITRE': 'MTRE3',
-                'HYPERA': 'HYPE3', 'ENGIE': 'EGIE3', 'VIVO': 'VIVT3',
-                'RAIZEN': 'RAIZ4', 'COSAN': 'CSAN3', 'RUMO': 'RAIL3',
-                'HAPVIDA': 'HAPV3', 'REDE DOR': 'RDOR3', 'BRF': 'BRFS3',
-                'DEXCO': 'DXCO3', 'MRV': 'MRVE3', 'BRASKEM': 'BRKM5',
-                'ALPARGATAS': 'ALPA4', 'IRB': 'IRBR3', 'CIELO': 'CIEL3',
-                'USIMINAS': 'USIM5', 'BB SEGURIDADE': 'BBSE3', 'PRIO': 'PRIO3',
-                'ENEVA': 'ENEV3', 'CSN': 'CSNA3', 'MARFRIG': 'MRFG3',
-                'MINERVA': 'BEEF3', 'JBS': 'JBSS3', 'COGNA': 'COGN3',
-                'CPFL': 'CPFE3', 'AZUL': 'AZUL4', 'GOL': 'GOLL4',
-            }
-            for keyword, ticker in NAME_MAP.items():
-                if keyword in nome and ticker not in mapped_tickers:
-                    ticker_map[cnpj] = ticker
-                    mapped_tickers.add(ticker)
-                    break
+        # Passo 2: Cruzar nome CVM com nome yfinance
+        best_match = None
+        best_score = 0
+        for tk, yname in fund_names.items():
+            if tk in mapped_tickers:
+                continue
+            # Match exato
+            if nome_cvm == yname:
+                best_match = tk
+                best_score = 100
+                break
+            # Match parcial: primeiras palavras
+            cvm_words = nome_cvm.split()
+            y_words = yname.split()
+            if len(cvm_words) >= 1 and len(y_words) >= 1:
+                # Primeira palavra igual (ex: PETROBRAS = PETROBRAS)
+                if cvm_words[0] == y_words[0] and len(cvm_words[0]) >= 4:
+                    score = 80
+                    # Bonus se 2+ palavras batem
+                    common = set(cvm_words) & set(y_words)
+                    score += len(common) * 5
+                    if score > best_score:
+                        best_score = score
+                        best_match = tk
+                # Nome contido no outro
+                elif nome_cvm in yname or yname in nome_cvm:
+                    score = 70
+                    if score > best_score:
+                        best_score = score
+                        best_match = tk
+        
+        if best_match and best_score >= 70:
+            ticker_map[cnpj] = best_match
+            mapped_tickers.add(best_match)
+            continue
+        
+        # Passo 3: Match pelo cadastro CVM (nome comercial)
+        cad = cad_names.get(cnpj_prefix)
+        if cad:
+            for tk, yname in fund_names.items():
+                if tk in mapped_tickers:
+                    continue
+                comercial = cad.get('comercial', '')
+                if comercial and len(comercial) >= 3:
+                    if comercial in yname or yname in comercial:
+                        ticker_map[cnpj] = tk
+                        mapped_tickers.add(tk)
+                        break
+                    # Primeira palavra
+                    c_words = comercial.split()
+                    y_words = yname.split()
+                    if c_words and y_words and c_words[0] == y_words[0] and len(c_words[0]) >= 4:
+                        ticker_map[cnpj] = tk
+                        mapped_tickers.add(tk)
+                        break
     
+    print(f"  Mapeados: {len(ticker_map)} (CNPJ: {sum(1 for c in ticker_map if c[:10] in [p.replace('.','') for p in CNPJ_MAP])}, nome: {len(ticker_map)-sum(1 for c in ticker_map if c[:10] in [p.replace('.','') for p in CNPJ_MAP])})")
     return ticker_map
 
 def main():
